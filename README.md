@@ -2,13 +2,15 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A Windows desktop proxy manager built on [mihomo](https://github.com/MetaCubeX/mihomo). Choose a node and connect in Simple mode, or manage multiple proxy ports, routing rules, and network interfaces in Full mode—without writing YAML.
+A Windows desktop proxy manager built on [mihomo](https://github.com/MetaCubeX/mihomo). Check the core and capture state on the overview, then manage proxy ports, routing rules, and network interfaces—without writing YAML.
 
 > Windows x64 only; the application UI is currently in Simplified Chinese.
 
+![Overview](docs/overview.png)
+
 ## Features
 
-- **Two interface modes**: Simple mode focuses on node selection and connecting; Full mode provides an overview, proxy management, process routing, subscriptions, and nodes. Switch modes in Settings while keeping existing configuration and connections.
+- **Overview**: core status, system capture, live traffic, and the default proxy stay on one page. A smaller window scales the page together and keeps the bottom actions in place.
 - **Three ways to connect**: Windows system proxy, selected applications through process routing, or TUN through a virtual adapter. TUN requires running Routa as administrator.
 - **Independent proxy ports**: create `mixed` (HTTP + SOCKS5), `http`, or `socks` listeners. Configure each port's node, proxy group or direct outbound, network interface, authentication, and LAN access together.
 - **Network interface isolation**: when a configured outbound becomes unavailable or its bound adapter disconnects, the affected listener is disabled rather than silently switching to direct or the default adapter. It resumes when the adapter is available again.
@@ -22,22 +24,11 @@ A Windows desktop proxy manager built on [mihomo](https://github.com/MetaCubeX/m
 
 ## Install
 
-Download `routa_<version>_x64-setup.exe` from [Releases](https://github.com/c0010c/Routa/releases) and run it. Verify downloads against `SHA256SUMS.txt` on the corresponding release. Builds bundle mihomo; the source pins its version in [`MIHOMO_VERSION`](src-tauri/binaries/MIHOMO_VERSION).
+Download `routa_<version>_x64-setup.exe` from [Releases](https://github.com/ChristopherZh-7/Routa/releases) and run it, or unzip `routa_<version>_x64_portable.zip` and run `routa.exe`. Verify downloads against `SHA256SUMS.txt` on the corresponding release. Builds bundle mihomo; the source pins its version in [`MIHOMO_VERSION`](src-tauri/binaries/MIHOMO_VERSION).
 
 The [WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/) is required. Windows 11 and up-to-date Windows 10 already include it; otherwise the regular installer downloads it from Microsoft during setup. For PCs without WebView2 that cannot reach Microsoft, use `routa_<version>_x64-offline-setup.exe` instead: it is much larger because it bundles the WebView2 offline installer. Auto-updates always use the regular installer.
 
 ## Quick start
-
-### Simple mode
-
-1. On first launch, choose **简洁版** (Simple).
-2. Import a subscription or add a node manually, then select a node.
-3. Choose **系统代理** (System proxy), **指定应用** (Selected apps), or **TUN** and turn the connection on. Selected apps requires installing the process-routing component and adding applications; TUN requires restarting Routa as administrator.
-4. Open Settings to change interface mode, auto-connect, startup behavior, or the close-window action.
-
-System proxy affects applications that honor Windows proxy settings. For applications that bypass those settings, use selected-app routing or TUN as appropriate.
-
-### Full mode
 
 1. Add subscriptions or nodes from **订阅** (Subscriptions) or **节点** (Nodes).
 2. Create a proxy on **代理** (Proxies): set its port, outbound node/group/direct connection, and optionally routing rules, network interface, authentication, or LAN access.

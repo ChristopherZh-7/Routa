@@ -2,13 +2,15 @@
 
 [English](README.md) | 简体中文
 
-基于 [mihomo](https://github.com/MetaCubeX/mihomo) 的 Windows 桌面代理管理工具。简洁版选节点即可连接；完整版可管理多个代理端口、分流规则与出站网卡，全程无需手写 YAML。
+基于 [mihomo](https://github.com/MetaCubeX/mihomo) 的 Windows 桌面代理管理工具。在概览里看内核和接管状态，再管理代理端口、分流规则与出站网卡，全程无需手写 YAML。
 
 > 仅支持 Windows x64，应用界面目前为简体中文。
 
+![概览](docs/overview.png)
+
 ## 功能
 
-- **双模式界面**：简洁版专注于选节点和连接；完整版提供概览、代理、进程分流、订阅与节点管理。可在设置中切换，保留已有配置和连接。
+- **概览**：同一页查看内核、系统接管、实时流量和默认代理，窗口变小时整页按比例缩小，底部操作保持在原位。
 - **三种接管方式**：Windows 系统代理、通过进程分流代理指定应用，或使用虚拟网卡的 TUN。TUN 需要以管理员身份运行 Routa。
 - **独立代理端口**：创建 `mixed`（HTTP + SOCKS5）、`http` 或 `socks` 监听器，在同一处配置端口使用的节点、策略组或直连出口，以及出站网卡、认证和局域网访问。
 - **网卡隔离**：配置的出口不可用或绑定网卡断开时，停用受影响的监听器，避免悄悄改走直连或默认网卡；网卡恢复后自动恢复。
@@ -22,22 +24,11 @@
 
 ## 安装
 
-从 [Releases](https://github.com/c0010c/Routa/releases) 下载 `routa_<版本>_x64-setup.exe` 并运行。可用对应 Release 中的 `SHA256SUMS.txt` 校验下载文件。构建内置 mihomo，源码使用的固定版本见 [`MIHOMO_VERSION`](src-tauri/binaries/MIHOMO_VERSION)。
+从 [Releases](https://github.com/ChristopherZh-7/Routa/releases) 下载 `routa_<版本>_x64-setup.exe` 并运行，或解压 `routa_<版本>_x64_portable.zip` 后直接运行 `routa.exe`。可用对应 Release 中的 `SHA256SUMS.txt` 校验下载文件。构建内置 mihomo，源码使用的固定版本见 [`MIHOMO_VERSION`](src-tauri/binaries/MIHOMO_VERSION)。
 
 运行需要 [WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/)。Windows 11 和保持更新的 Windows 10 已自带；没有时，普通安装包会在安装过程中从微软下载。如果电脑没有 WebView2 且无法访问微软，请改用 `routa_<版本>_x64-offline-setup.exe`：它内置 WebView2 离线安装程序，体积大得多。自动更新始终使用普通安装包。
 
 ## 快速开始
-
-### 简洁版
-
-1. 首次启动时选择 **简洁版**。
-2. 导入订阅或手动添加节点，然后选择要使用的节点。
-3. 选择 **系统代理**、**指定应用** 或 **TUN**，再开启连接。指定应用需要安装进程分流组件并添加应用；TUN 需要先退出 Routa，再以管理员身份运行。
-4. 在设置中调整界面模式、启动后自动连接、开机启动和关闭窗口行为。
-
-系统代理只影响遵循 Windows 代理设置的应用。对于不使用系统代理的应用，可按需选择指定应用分流或 TUN。
-
-### 完整版
 
 1. 在 **订阅** 或 **节点** 页面添加资源。
 2. 在 **代理** 页面新建代理，配置端口、节点/策略组/直连，以及可选的分流规则、出站网卡、认证和局域网访问。
