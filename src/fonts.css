@@ -1,0 +1,29 @@
+.quiet-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.quiet-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.quiet-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.quiet-scroll::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 8px;
+}
+.quiet-scroll.is-scrolling {
+  scrollbar-color: var(--mui-palette-text-secondary, rgba(0, 0, 0, 0.35)) transparent;
+}
+.quiet-scroll.is-scrolling::-webkit-scrollbar-thumb {
+  background-color: var(--mui-palette-text-secondary, rgba(0, 0, 0, 0.35));
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./assets/InterVariable.woff2") format("woff2");
+}

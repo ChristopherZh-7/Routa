@@ -1,0 +1,1397 @@
+//! Persisted presentation preferences and the single explicitly managed proxy.
+use crate::{
+    aiapps::{rules as ai_rules, AiApps, CatalogApp},
+    core::{apply::ApplyOutcome, process::CoreState},
+    model::*,
+    runtime::Runtime,
+    store::{read_json, write_json_atomic},
+    system_proxy::SystemProxy,
+};
+use crate::model::validate::{process_file_name, process_rule_label};
+use serde::{Deserialize, Serialize};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub enum InterfaceMode {
+    Simple,
+    Full,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub enum CaptureMode {
+    #[default]
+    System,
+    Apps,
+    Tun,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub enum TaskbarStatusMode {
+    #[default]
+    Rotate,
+    Fixed(ListenerId),
+}
+/// The bar shows one of the two, to stay narrow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub enum TaskbarTraffic {
+    #[default]
+    Values,
+    Chart,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(default)]
+pub struct TaskbarStatusPrefs {
+    pub enabled: bool,
+    pub mode: TaskbarStatusMode,
+    pub traffic: TaskbarTraffic,
+}
+impl Default for TaskbarStatusPrefs {
+    fn default() -> Self {
+        Self { enabled: true, mode: TaskbarStatusMode::Rotate, traffic: TaskbarTraffic::Values }
+    }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, specta::Type)]
+#[serde(default)]
+pub struct UiPreferences {
+    pub mode: Option<InterfaceMode>,
+    pub listener_id: Option<ListenerId>,
+    pub exit_id: Option<ExitId>,
+    pub system_listener_id: Option<ListenerId>,
+    pub capture_mode: CaptureMode,
+    pub auto_connect: bool,
+    pub close_to_tray: bool,
+    pub managed_rules: Vec<ProcessRuleId>,
+    pub selected_apps: Vec<ProcessRuleId>,
+    pub taskbar_status: TaskbarStatusPrefs,
+    /// The AI apps page no longer asks before resetting an app's connections.
+    pub skip_ai_reset_prompt: bool,
+}
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct DesktopState {
+    pub preferences: UiPreferences,
+    pub connection: Option<CaptureMode>,
+    pub requested: Option<CaptureMode>,
+    pub error: Option<String>,
+    pub is_admin: bool,
+    pub system_listener_id: Option<ListenerId>,
+    pub taskbar_status_supported: bool,
+}
+fn taskbar_status_supported() -> bool {
+    #[cfg(windows)]
+    return crate::taskbar_status::host::supported();
+    #[cfg(not(windows))]
+    false
+}
+/// The node the simple-mode default exit points at.
+fn simple_node(model: &Model, prefs: &UiPreferences) -> Option<NodeRef> {
+    let id = prefs.exit_id.as_ref()?;
+    match &model.exits.iter().find(|e| &e.id == id)?.kind {
+        ExitKind::Node { node } => Some(node.clone()),
+        _ => None,
+    }
+}
+pub struct Desktop {
+    file: PathBuf,
+    prefs: Mutex<UiPreferences>,
+    active: Mutex<Option<CaptureMode>>,
+    active_system_listener: Mutex<Option<ListenerId>>,
+    error: Mutex<Option<String>>,
+    operation: tokio::sync::Mutex<()>,
+    proxy: SystemProxy,
+    fresh: bool,
+}
+fn result_ok(outcome: &ApplyOutcome) -> Result<(), String> {
+    match outcome {
+        ApplyOutcome::Reloaded {
+            failed_listeners,
+            uncut,
+            ..
+        } if failed_listeners.is_empty() && *uncut == 0 => Ok(()),
+        ApplyOutcome::Reloaded { failed_listeners, .. } => Err(format!(
+            "配置尚未完全生效，请检查监听端口或现有连接：{}",
+            failed_listeners
+                .iter()
+                .map(|l| format!("{} ({})", l.name, l.port))
+                .collect::<Vec<_>>()
+                .join("、")
+        )),
+        ApplyOutcome::FailedKeptPrevious { error }
+        | ApplyOutcome::FailedClosed { error, .. }
+        | ApplyOutcome::FailedCoreStopped { error }
+        | ApplyOutcome::NotRunning { error } => Err(format!("配置未能生效：{error}")),
+    }
+}
+pub(crate) fn validation(e: Vec<ValidationError>) -> String {
+    e.into_iter()
+        .map(|e| match e {
+            ValidationError::DuplicateName { name, .. } => format!("名称「{name}」已存在"),
+            ValidationError::PortConflict { port, with } => format!("端口 {port} 已被「{with}」占用"),
+            ValidationError::InvalidName { reason, .. }
+            | ValidationError::InvalidProxy { reason, .. }
+            | ValidationError::InvalidExePath { reason, .. } => reason,
+            ValidationError::IntervalOutOfRange { .. } => "更新间隔不在允许范围内".into(),
+            ValidationError::DanglingRef { .. } => "引用的监听器、出口或节点已不存在，请重新选择".into(),
+            ValidationError::InterfaceMismatch { exit, node } => {
+                format!("出口「{exit}」与节点「{node}」使用的网卡不一致")
+            }
+            ValidationError::CoreRejected { message } => format!("内核未接受配置：{message}"),
+            ValidationError::DuplicateProcessRule { exe_path } => format!("{exe_path} 已有分流规则"),
+            ValidationError::TooManyProcessRules { max } => format!("走代理的「节点 + 网卡」组合最多 {max} 个"),
+            ValidationError::EmptyProcessRule { rule } => format!("规则「{rule}」至少要有一个进程"),
+            ValidationError::AiAppProcess { exe_path, app } => format!("{exe_path} 已由 AI 应用「{app}」管理，请在 AI 应用页操作"),
+        })
+        .collect::<Vec<_>>()
+        .join("；")
+}
+pub fn is_admin() -> bool {
+    #[cfg(windows)]
+    {
+        unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+impl Desktop {
+    pub fn close_to_tray(&self) -> bool {
+        self.prefs().close_to_tray
+    }
+    pub fn open(dir: PathBuf) -> Result<Self, String> {
+        let file = dir.join("ui-preferences.json");
+        let fresh = !dir.join("state.json").exists() && !file.exists();
+        let prefs = read_json::<UiPreferences>(&file)
+            .map_err(|e| format!("读取界面设置失败：{e}"))?
+            .unwrap_or_else(|| UiPreferences {
+                mode: if fresh { None } else { Some(InterfaceMode::Full) },
+                close_to_tray: true,
+                ..Default::default()
+            });
+        let proxy = SystemProxy::new(dir.join("system-proxy-lease.json"));
+        // Recover a previous interrupted run, but never clobber a newer proxy owner.
+        proxy.release()?;
+        Ok(Self {
+            file,
+            prefs: Mutex::new(prefs),
+            active: Mutex::new(None),
+            active_system_listener: Mutex::new(None),
+            error: Mutex::new(None),
+            operation: tokio::sync::Mutex::new(()),
+            proxy,
+            fresh,
+        })
+    }
+    fn prefs(&self) -> UiPreferences {
+        self.prefs.lock().unwrap().clone()
+    }
+    fn persist(&self, p: UiPreferences) -> Result<UiPreferences, String> {
+        write_json_atomic(&self.file, &p).map_err(|e| format!("保存界面设置失败：{e}"))?;
+        *self.prefs.lock().unwrap() = p.clone();
+        Ok(p)
+    }
+    pub async fn initialize(&self, rt: &Runtime) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        if self.fresh && self.prefs().listener_id.is_none() && rt.model().listeners.is_empty() {
+            self.bind_inner(rt, None).await?;
+        }
+        // A failed fill must not break the state query; the rules stay blocked until fixed.
+        if let Err(e) = self.fill_managed_rule_nodes(rt).await {
+            *self.error.lock().unwrap() = Some(format!("应用规则未能补全节点：{e}"));
+        }
+        Ok(())
+    }
+    /// Rules made before rules carried a node follow the simple-mode node.
+    async fn fill_managed_rule_nodes(&self, rt: &Runtime) -> Result<(), String> {
+        let p = self.prefs();
+        let model = rt.model();
+        let Some(node) = simple_node(&model, &p) else { return Ok(()) };
+        if !model
+            .process_routing
+            .rules
+            .iter()
+            .any(|r| p.managed_rules.contains(&r.id) && r.node.is_none())
+        {
+            return Ok(());
+        }
+        rt.mutate_process_routing(|pr| {
+            for r in &mut pr.rules {
+                if p.managed_rules.contains(&r.id) && r.node.is_none() {
+                    r.node = Some(node.clone());
+                }
+            }
+        })
+        .await
+        .map_err(validation)?;
+        Ok(())
+    }
+    pub fn state(&self, rt: &Runtime) -> DesktopState {
+        let prefs = self.prefs();
+        let requested = *self.active.lock().unwrap();
+        let running = matches!(rt.status().core, crate::core::process::CoreState::Running);
+        let system_listener_id = self.active_system_listener.lock().unwrap().clone();
+        let effective = system_listener_id
+            .as_ref()
+            .or(prefs.listener_id.as_ref())
+            .is_some_and(|id| rt.status().effective_listeners.contains(id));
+        let valid = running
+            && effective
+            && match requested {
+                Some(CaptureMode::System) => {
+                    let id = system_listener_id.as_ref().or(prefs.listener_id.as_ref());
+                    rt.model()
+                        .listeners
+                        .iter()
+                        .find(|l| Some(&l.id) == id)
+                        .is_some_and(|l| self.proxy.owns_port(l.port))
+                }
+                Some(CaptureMode::Apps) => {
+                    let status = crate::procroute::client::status();
+                    let model = rt.model();
+                    let node = simple_node(&model, &prefs);
+                    node.is_some()
+                        && !prefs.selected_apps.is_empty()
+                        && crate::procroute::client::current_rules_confirmed(rt)
+                        && prefs.selected_apps.iter().all(|id| {
+                            status.actions.get(id).is_some_and(|a| a.action == "Proxy")
+                                && model
+                                    .process_routing
+                                    .rules
+                                    .iter()
+                                    .any(|r| &r.id == id && r.node == node)
+                        })
+                }
+                Some(CaptureMode::Tun) => rt.tun_adapter_ready(),
+                None => false,
+            };
+        DesktopState {
+            preferences: prefs,
+            connection: requested.filter(|_| valid),
+            requested,
+            error: self.error.lock().unwrap().clone(),
+            is_admin: is_admin(),
+            system_listener_id,
+            taskbar_status_supported: taskbar_status_supported(),
+        }
+    }
+    pub async fn save_preferences(&self, input: UiPreferences) -> Result<UiPreferences, String> {
+        let _guard = self.operation.lock().await;
+        let mut p = self.prefs();
+        // Management IDs are backend-owned, not mutable presentation settings.
+        p.mode = input.mode;
+        p.auto_connect = input.auto_connect;
+        p.close_to_tray = input.close_to_tray;
+        p.taskbar_status = input.taskbar_status;
+        p.skip_ai_reset_prompt = input.skip_ai_reset_prompt;
+        if self.active.lock().unwrap().is_none() {
+            p.capture_mode = input.capture_mode;
+        }
+        self.persist(p)
+    }
+    pub fn taskbar_status(&self) -> TaskbarStatusPrefs {
+        self.prefs().taskbar_status
+    }
+    /// The capture switched on and the listener it goes through, without the
+    /// health checks `state` runs.
+    pub fn active_capture(&self) -> Option<(CaptureMode, ListenerId)> {
+        let mode = (*self.active.lock().unwrap())?;
+        let override_id = self.active_system_listener.lock().unwrap().clone();
+        Some((mode, override_id.or(self.prefs().listener_id)?))
+    }
+    pub async fn disable_taskbar_status(&self) -> Result<UiPreferences, String> {
+        let _guard = self.operation.lock().await;
+        let mut p = self.prefs();
+        p.taskbar_status.enabled = false;
+        self.persist(p)
+    }
+    pub async fn bind(&self, rt: &Runtime, id: Option<ListenerId>) -> Result<UiPreferences, String> {
+        let _guard = self.operation.lock().await;
+        if self.active.lock().unwrap().is_some() {
+            return Err("请先关闭当前代理，再更改默认监听器".into());
+        }
+        self.bind_inner(rt, id).await
+    }
+    async fn bind_inner(&self, rt: &Runtime, id: Option<ListenerId>) -> Result<UiPreferences, String> {
+        let m = rt.model();
+        let mut p = self.prefs();
+        let listener = if let Some(id) = id {
+            m.listeners
+                .iter()
+                .find(|l| l.id == id)
+                .cloned()
+                .ok_or("所选监听器已不存在")?
+        } else {
+            if m.listeners.iter().any(|l| l.port == 7881) || m.settings.controller_port == 7881 {
+                return Err("端口 7881 已被配置占用，请选择已有监听器".into());
+            }
+            let mut name = "默认监听器".to_string();
+            for i in 2.. {
+                if !m.listeners.iter().any(|l| l.name == name) {
+                    break;
+                }
+                name = format!("默认监听器 {i}");
+            }
+            let mut l = Listener::new_default(name, 7881);
+            l.listen = "127.0.0.1".into();
+            l
+        };
+        if listener.listener_type == ListenerType::Http || listener.auth.is_some() {
+            return Err("简洁版需要无需认证的混合或 SOCKS5 监听器".into());
+        }
+        p.listener_id = Some(listener.id.clone());
+        p.exit_id = Some(ExitId::new());
+        // Reserve identifiers durably before creating model objects.
+        let saved = self.persist(p)?;
+        if !m.listeners.iter().any(|l| l.id == listener.id) {
+            rt.mutate(|m| m.listeners.push(listener)).await.map_err(validation)?;
+        }
+        Ok(saved)
+    }
+    pub async fn select_node(&self, rt: &Runtime, node: NodeRef) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        let p = self.prefs();
+        let before = rt.model();
+        if crate::model::resolve::resolve(&before, &node).is_none() {
+            return Err("节点已失效，请重新选择".into());
+        }
+        let id = p.listener_id.ok_or("请先选择默认监听器")?;
+        let exit_id = p.exit_id.ok_or("默认代理未配置，请重新绑定监听器")?;
+        let previous_listener = before
+            .listeners
+            .iter()
+            .find(|l| l.id == id)
+            .cloned()
+            .ok_or("默认监听器已删除，请重新选择")?;
+        let previous_exit = before.exits.iter().find(|e| e.id == exit_id).cloned();
+        let previous_rule_nodes: Vec<(ProcessRuleId, Option<NodeRef>)> = before
+            .process_routing
+            .rules
+            .iter()
+            .filter(|r| p.managed_rules.contains(&r.id))
+            .map(|r| (r.id.clone(), r.node.clone()))
+            .collect();
+        let outcome = rt
+            .mutate(|m| {
+                let name = previous_exit.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| {
+                    let mut n = "默认代理".to_string();
+                    let mut i = 2;
+                    while m.exits.iter().any(|e| e.name == n) {
+                        n = format!("默认代理 {i}");
+                        i += 1;
+                    }
+                    n
+                });
+                let exit = Exit {
+                    id: exit_id.clone(),
+                    name,
+                    kind: ExitKind::Node { node: node.clone() },
+                    interface: None,
+                    hidden: false,
+                };
+                if let Some(e) = m.exits.iter_mut().find(|e| e.id == exit_id) {
+                    *e = exit;
+                } else {
+                    m.exits.push(exit);
+                }
+                let l = m.listeners.iter_mut().find(|l| l.id == id).unwrap();
+                l.exit = Some(exit_id.clone());
+                l.user_enabled = true;
+                for r in &mut m.process_routing.rules {
+                    if p.managed_rules.contains(&r.id) {
+                        r.node = Some(node.clone());
+                    }
+                }
+            })
+            .await
+            .map_err(validation)?;
+        // Offline edits can be saved; connect later starts and verifies the core.
+        if !matches!(outcome, ApplyOutcome::NotRunning { .. }) {
+            if let Err(error) = result_ok(&outcome) {
+                let _ = rt
+                    .mutate(|m| {
+                        if let Some(l) = m.listeners.iter_mut().find(|l| l.id == id) {
+                            *l = previous_listener;
+                        }
+                        m.exits.retain(|e| e.id != exit_id);
+                        if let Some(e) = previous_exit {
+                            m.exits.push(e);
+                        }
+                        for (id, node) in previous_rule_nodes {
+                            if let Some(r) = m.process_routing.rules.iter_mut().find(|r| r.id == id) {
+                                r.node = node;
+                            }
+                        }
+                    })
+                    .await;
+                return Err(error);
+            }
+        }
+        if self.active.lock().unwrap().as_ref() == Some(&CaptureMode::Tun) {
+            rt.set_tun_exit(Some(exit_id)).await?;
+        }
+        Ok(())
+    }
+    pub async fn save_app(&self, rt: &Runtime, path: String, selected: bool) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        let mut p = self.prefs();
+        p.listener_id.as_ref().ok_or("请先设置默认代理")?;
+        let model = rt.model();
+        let node = simple_node(&model, &p).ok_or("请先选择节点")?;
+        let normalized = crate::model::normalize::normalize_exe_path(&path);
+        let file_name = process_file_name(&normalized).to_lowercase();
+        let full_path = normalized.to_lowercase();
+        // 同一程序只能属于一条规则：同文件名的按名字条目或同路径的按路径条目都会命中它。
+        let same_program = |x: &ProcessEntry| match x.kind {
+            ProcessKind::Name => x.value.to_lowercase() == file_name,
+            ProcessKind::Path => crate::model::normalize::normalize_exe_path(&x.value).to_lowercase() == full_path,
+        };
+        let existing = model.process_routing.rules.iter().find(|r| r.processes.iter().any(same_program));
+        if existing.is_some_and(|r| !p.managed_rules.contains(&r.id)) {
+            return Err("该程序已有完整版规则，请在进程分流中修改".into());
+        }
+        // 简洁版的规则一条一个程序，按完整路径匹配，组件故障时阻断。
+        let mut rule = existing.cloned().unwrap_or_else(|| ProcessRule {
+            processes: vec![ProcessEntry::path(path)],
+            on_fault: crate::model::FaultPolicy::Block,
+            ..Default::default()
+        });
+        rule.node = Some(node);
+        rule.interface = None;
+        rule.user_enabled = selected && self.active.lock().unwrap().as_ref() == Some(&CaptureMode::Apps);
+        if !p.managed_rules.contains(&rule.id) {
+            p.managed_rules.push(rule.id.clone());
+        }
+        p.selected_apps.retain(|id| id != &rule.id);
+        if selected {
+            p.selected_apps.push(rule.id.clone());
+        }
+        let old_preferences = self.prefs();
+        self.persist(p)?;
+        if let Err(errors) = rt
+            .mutate_process_routing(|pr| {
+                if let Some(r) = pr.rules.iter_mut().find(|r| r.id == rule.id) {
+                    *r = rule;
+                } else {
+                    pr.rules.push(rule);
+                }
+            })
+            .await
+        {
+            self.persist(old_preferences)?;
+            return Err(validation(errors));
+        }
+        Ok(())
+    }
+    async fn disable_capture(&self, rt: &Runtime) -> Result<(), String> {
+        self.proxy.release()?;
+        let active = *self.active.lock().unwrap();
+        if active == Some(CaptureMode::Tun) {
+            rt.set_tun_exit(None).await?;
+        }
+        if active == Some(CaptureMode::Apps) {
+            let ids = self.prefs().managed_rules;
+            rt.mutate_process_routing(|pr| {
+                for r in &mut pr.rules {
+                    if ids.contains(&r.id) {
+                        r.user_enabled = false;
+                    }
+                }
+            })
+            .await
+            .map_err(validation)?;
+        }
+        *self.active.lock().unwrap() = None;
+        *self.active_system_listener.lock().unwrap() = None;
+        Ok(())
+    }
+    async fn enable_capture(
+        &self,
+        rt: &Runtime,
+        mode: CaptureMode,
+        listener_override: Option<&ListenerId>,
+    ) -> Result<(), String> {
+        let p = self.prefs();
+        let model = rt.model();
+        let id = listener_override
+            .or(p.listener_id.as_ref())
+            .ok_or("请先选择默认监听器")?;
+        let l = model
+            .listeners
+            .iter()
+            .find(|l| &l.id == id)
+            .ok_or("默认监听器已不存在")?;
+        if !l.user_enabled || l.exit.is_none() {
+            return Err("请先选择节点并启用默认监听器".into());
+        }
+        if mode == CaptureMode::Tun && !is_admin() {
+            return Err("TUN 需要管理员权限。请退出后以管理员身份运行 Routa，再开启 TUN。".into());
+        }
+        if !matches!(rt.status().core, crate::core::process::CoreState::Running) {
+            rt.start().await.map_err(|e| e.to_string())?;
+        }
+        if !rt.status().effective_listeners.contains(id) {
+            return Err("默认监听器未能生效，请检查端口或节点".into());
+        }
+        match mode {
+            CaptureMode::System => {
+                if l.listener_type != ListenerType::Mixed {
+                    return Err("系统代理需要混合监听器，请在代理页更改类型或绑定混合监听器".into());
+                }
+                if !matches!(l.listen.as_str(), "127.0.0.1" | "0.0.0.0" | "localhost") {
+                    return Err("系统代理需要监听本机 IPv4 地址".into());
+                }
+                self.proxy.enable(l.port)?;
+            }
+            CaptureMode::Tun => {
+                rt.set_tun_exit(l.exit.clone()).await?;
+                for _ in 0..20 {
+                    if rt.tun_adapter_ready() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !rt.tun_adapter_ready() {
+                    let _ = rt.set_tun_exit(None).await;
+                    return Err("TUN 网卡未就绪，请检查管理员权限和内核日志".into());
+                }
+            }
+            CaptureMode::Apps => {
+                if p.selected_apps.is_empty() {
+                    return Err("请先选择需要代理的应用".into());
+                }
+                let node = simple_node(&model, &p).ok_or("请先选择节点")?;
+                if let Some(rule) = model
+                    .process_routing
+                    .rules
+                    .iter()
+                    .find(|r| p.selected_apps.contains(&r.id) && r.node.as_ref() != Some(&node))
+                {
+                    return Err(format!(
+                        "{} 在完整版使用了其他节点，请在简洁版关闭并重新勾选该应用，再开启代理",
+                        process_rule_label(rule)
+                    ));
+                }
+                if !matches!(
+                    crate::procroute::client::status().component,
+                    crate::procroute::client::ComponentState::Running
+                ) {
+                    return Err("请先安装或启动应用分流组件".into());
+                }
+                rt.mutate_process_routing(|pr| {
+                    for r in &mut pr.rules {
+                        if p.managed_rules.contains(&r.id) {
+                            r.user_enabled = p.selected_apps.contains(&r.id);
+                        }
+                    }
+                })
+                .await
+                .map_err(validation)?;
+                for _ in 0..30 {
+                    let actions = crate::procroute::client::status().actions;
+                    if crate::procroute::client::current_rules_confirmed(rt)
+                        && p.selected_apps
+                            .iter()
+                            .all(|id| actions.get(id).is_some_and(|a| a.action == "Proxy"))
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let _ = rt
+                    .mutate_process_routing(|pr| {
+                        for r in &mut pr.rules {
+                            if p.managed_rules.contains(&r.id) {
+                                r.user_enabled = false;
+                            }
+                        }
+                    })
+                    .await;
+                return Err("应用规则未确认生效，请检查组件状态后重试".into());
+            }
+        }
+        Ok(())
+    }
+    pub async fn connect(&self, rt: &Runtime, mode: Option<CaptureMode>) -> Result<DesktopState, String> {
+        self.connect_for(rt, mode, None).await
+    }
+    pub async fn system_for_listener(&self, rt: &Runtime, id: ListenerId) -> Result<DesktopState, String> {
+        self.connect_for(rt, Some(CaptureMode::System), Some(id)).await
+    }
+    async fn connect_for(
+        &self,
+        rt: &Runtime,
+        mode: Option<CaptureMode>,
+        listener_override: Option<ListenerId>,
+    ) -> Result<DesktopState, String> {
+        let _guard = self.operation.lock().await;
+        let previous = *self.active.lock().unwrap();
+        let previous_listener = self.active_system_listener.lock().unwrap().clone();
+        if mode == previous
+            && mode.is_some()
+            && listener_override == previous_listener
+            && self.state(rt).connection == mode
+        {
+            return Ok(self.state(rt));
+        }
+        self.disable_capture(rt).await?;
+        if let Some(mode) = mode {
+            if let Err(error) = self.enable_capture(rt, mode, listener_override.as_ref()).await {
+                *self.error.lock().unwrap() = Some(error.clone());
+                if let Some(old) = previous {
+                    if self.enable_capture(rt, old, previous_listener.as_ref()).await.is_ok() {
+                        *self.active.lock().unwrap() = Some(old);
+                        *self.active_system_listener.lock().unwrap() = previous_listener;
+                    }
+                }
+                return Err(error);
+            }
+            *self.active.lock().unwrap() = Some(mode);
+            let mut p = self.prefs();
+            p.capture_mode = mode;
+            *self.active_system_listener.lock().unwrap() = listener_override.clone();
+            if let Some(id) = listener_override {
+                p.system_listener_id = Some(id);
+            }
+            if let Err(e) = self.persist(p) {
+                let _ = self.disable_capture(rt).await;
+                return Err(e);
+            }
+        }
+        *self.error.lock().unwrap() = None;
+        Ok(self.state(rt))
+    }
+    pub async fn set_port(&self, rt: &Runtime, port: u16) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        let id = self.prefs().listener_id.ok_or("没有默认监听器")?;
+        let old = rt
+            .model()
+            .listeners
+            .iter()
+            .find(|l| l.id == id)
+            .cloned()
+            .ok_or("默认监听器已删除")?;
+        let outcome = rt
+            .mutate(|m| {
+                if let Some(l) = m.listeners.iter_mut().find(|l| l.id == id) {
+                    l.port = port;
+                }
+            })
+            .await
+            .map_err(validation)?;
+        let applied = if matches!(outcome, ApplyOutcome::NotRunning { .. }) {
+            Ok(())
+        } else {
+            result_ok(&outcome)
+        };
+        let capture_listener = self
+            .active_system_listener
+            .lock()
+            .unwrap()
+            .clone()
+            .or(self.prefs().listener_id);
+        let update = applied.and_then(|_| {
+            if self.active.lock().unwrap().as_ref() == Some(&CaptureMode::System)
+                && capture_listener.as_ref() == Some(&id)
+            {
+                self.proxy.enable(port)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = update {
+            let _ = rt
+                .mutate(|m| {
+                    if let Some(l) = m.listeners.iter_mut().find(|l| l.id == id) {
+                        *l = old;
+                    }
+                })
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+    pub async fn shutdown(&self, rt: &Runtime) {
+        let _guard = self.operation.lock().await;
+        if let Err(e) = self.disable_capture(rt).await {
+            eprintln!("restore capture on exit: {e}");
+        }
+    }
+    pub fn spawn_monitor(self: Arc<Self>, rt: Arc<Runtime>) {
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _guard = self.operation.lock().await;
+                if self.active.lock().unwrap().as_ref() == Some(&CaptureMode::System) {
+                    let state = rt.status();
+                    if matches!(state.core, crate::core::process::CoreState::Starting) {
+                        continue;
+                    }
+                    let id = self
+                        .active_system_listener
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .or(self.prefs().listener_id);
+                    let model = rt.model();
+                    let target = model.listeners.iter().find(|l| {
+                        Some(&l.id) == id.as_ref()
+                            && l.listener_type == ListenerType::Mixed
+                            && matches!(l.listen.as_str(), "127.0.0.1" | "localhost" | "0.0.0.0")
+                            && state.effective_listeners.contains(&l.id)
+                    });
+                    let owns = self.proxy.owns().unwrap_or(false);
+                    let result = if let Some(l) =
+                        target.filter(|_| owns && matches!(state.core, crate::core::process::CoreState::Running))
+                    {
+                        if self.proxy.owns_port(l.port) {
+                            Ok(())
+                        } else {
+                            self.proxy.enable(l.port)
+                        }
+                    } else {
+                        let result = self.proxy.release();
+                        if result.is_ok() {
+                            *self.active.lock().unwrap() = None;
+                            *self.active_system_listener.lock().unwrap() = None;
+                        }
+                        result
+                    };
+                    if let Err(e) = result {
+                        *self.error.lock().unwrap() = Some(e);
+                    }
+                }
+            }
+        });
+    }
+}
+
+type Dt<'a> = tauri::State<'a, Arc<Desktop>>;
+type Rt<'a> = tauri::State<'a, Arc<Runtime>>;
+#[tauri::command]
+#[specta::specta]
+pub async fn desktop_state(dt: Dt<'_>, rt: Rt<'_>) -> Result<DesktopState, String> {
+    dt.initialize(&rt).await?;
+    Ok(dt.state(&rt))
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn save_ui_preferences(dt: Dt<'_>, input: UiPreferences) -> Result<UiPreferences, String> {
+    dt.save_preferences(input).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn bind_default_listener(dt: Dt<'_>, rt: Rt<'_>, id: Option<ListenerId>) -> Result<UiPreferences, String> {
+    dt.bind(&rt, id).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn select_simple_node(dt: Dt<'_>, rt: Rt<'_>, node: NodeRef) -> Result<(), String> {
+    dt.select_node(&rt, node).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn set_desktop_connection(dt: Dt<'_>, rt: Rt<'_>, mode: Option<CaptureMode>) -> Result<DesktopState, String> {
+    dt.connect(&rt, mode).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn set_system_proxy_listener(dt: Dt<'_>, rt: Rt<'_>, id: ListenerId) -> Result<DesktopState, String> {
+    dt.system_for_listener(&rt, id).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn save_simple_app(dt: Dt<'_>, rt: Rt<'_>, path: String, selected: bool) -> Result<(), String> {
+    dt.save_app(&rt, path, selected).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn set_simple_port(dt: Dt<'_>, rt: Rt<'_>, port: u16) -> Result<(), String> {
+    dt.set_port(&rt, port).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn get_connection_details(rt: Rt<'_>) -> Result<Vec<crate::runtime::ConnectionInfo>, String> {
+    rt.connection_details().await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn read_core_log(rt: Rt<'_>) -> Result<String, String> {
+    read_log_tail(&rt.core_workdir().join("mihomo.log"), 64 * 1024)
+}
+
+fn read_log_tail(path: &std::path::Path, max_bytes: u64) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let length = f.metadata().map_err(|e| e.to_string())?.len();
+    let start = length.saturating_sub(max_bytes);
+    // Include the preceding byte to tell a line boundary from a partial record.
+    let offset = start.saturating_sub(1);
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    f.take(length - offset).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let first = if start > 0 {
+        bytes.iter().position(|b| *b == b'\n').map_or(bytes.len(), |i| i + 1)
+    } else { 0 };
+    Ok(String::from_utf8_lossy(&bytes[first..]).into_owned())
+}
+fn procroute_running() -> bool {
+    matches!(
+        crate::procroute::client::status().component,
+        crate::procroute::client::ComponentState::Running
+    )
+}
+
+/// Asks the process routing component to pick up the current rules and waits
+/// up to 5 s for it to confirm them. Returns whether it confirmed; if not,
+/// applies `revert` to the process routing and returns `Ok(false)`.
+async fn confirm_or_revert(rt: &Runtime, revert: impl FnOnce(&mut ProcessRouting)) -> Result<bool, String> {
+    crate::procroute::client::runtime_changed();
+    for _ in 0..50 {
+        if crate::procroute::client::current_rules_confirmed(rt) {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    rt.mutate_process_routing(revert).await.map_err(validation)?;
+    Ok(false)
+}
+
+/// Why the rule dialog's save failed: field errors for the form, or a message.
+#[derive(Serialize, Debug, PartialEq, specta::Type)]
+#[serde(untagged)]
+pub enum RuleSaveError {
+    Validation(Vec<ValidationError>),
+    Operation(String),
+}
+
+/// `Err` with the user-facing message when a reload happened and did not
+/// fully succeed.
+fn reload_ok(outcome: &Option<ApplyOutcome>) -> Result<(), String> {
+    match outcome {
+        Some(o) => result_ok(o).map_err(|e| format!("内核重载失败：{e}")),
+        None => Ok(()),
+    }
+}
+
+impl Desktop {
+    /// Points rule `id` at `node`. While the rule is
+    /// enabled, waits for the component to confirm; otherwise restores the
+    /// previous node.
+    pub async fn change_process_node(&self, rt: &Runtime, id: ProcessRuleId, node: NodeRef) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        let model = rt.model();
+        let old = model
+            .process_routing
+            .rules
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+            .ok_or("规则已不存在")?;
+        if resolve(&model, &node).is_none() {
+            return Err("节点已失效，请重新选择".into());
+        }
+        let outcome = rt
+            .mutate_process_routing(|pr| {
+                if let Some(r) = pr.rules.iter_mut().find(|r| r.id == id) {
+                    r.node = Some(node.clone());
+                }
+            })
+            .await
+            .map_err(validation)?;
+        let revert = |pr: &mut ProcessRouting| {
+            if let Some(r) = pr.rules.iter_mut().find(|r| r.id == id && r.node.as_ref() == Some(&node)) {
+                r.node = old.node.clone();
+            }
+        };
+        if let Err(e) = reload_ok(&outcome) {
+            let _ = rt.mutate_process_routing(revert).await;
+            return Err(e);
+        }
+        if !(old.user_enabled && procroute_running()) {
+            return Ok(());
+        }
+        let confirmed = confirm_or_revert(rt, revert).await?;
+        if confirmed {
+            Ok(())
+        } else {
+            Err("节点切换未能确认生效，已恢复原节点，请检查组件状态后重试".into())
+        }
+    }
+
+    /// Saves (creates or edits) `rule` from the rule dialog. While the rule
+    /// is (or was) enabled, waits for the component
+    /// to confirm; a failed reload or a missing confirmation restores the
+    /// previous rule (or removes a new one).
+    pub async fn save_process_rule_confirmed(
+        &self,
+        rt: &Runtime,
+        rule: ProcessRule,
+    ) -> Result<Option<ApplyOutcome>, RuleSaveError> {
+        let _guard = self.operation.lock().await;
+        let model = rt.model();
+        let id = rule.id.clone();
+        let old = model.process_routing.rules.iter().find(|r| r.id == id).cloned();
+        let enabled = rule.user_enabled || old.as_ref().is_some_and(|o| o.user_enabled);
+        let outcome = crate::commands::ops::save_process_rule(rt, rule)
+            .await
+            .map_err(RuleSaveError::Validation)?;
+        let saved = rt.model().process_routing.rules.iter().find(|r| r.id == id).cloned();
+        let revert = |pr: &mut ProcessRouting| {
+            let Some(pos) = pr.rules.iter().position(|r| Some(r) == saved.as_ref()) else { return };
+            match &old {
+                Some(o) => pr.rules[pos] = o.clone(),
+                None => {
+                    pr.rules.remove(pos);
+                }
+            }
+        };
+        if let Err(e) = reload_ok(&outcome) {
+            let _ = rt.mutate_process_routing(revert).await;
+            return Err(RuleSaveError::Operation(e));
+        }
+        if !(enabled && procroute_running()) {
+            return Ok(outcome);
+        }
+        if confirm_or_revert(rt, revert).await.map_err(RuleSaveError::Operation)? {
+            Ok(outcome)
+        } else {
+            Err(RuleSaveError::Operation(
+                "规则保存未能确认生效，已恢复原状态，请检查组件状态后重试".into(),
+            ))
+        }
+    }
+
+    /// Enables or disables rule `id`. While the component runs, waits for
+    /// the component to confirm; otherwise restores the previous state.
+    pub async fn set_process_rule_enabled(&self, rt: &Runtime, id: ProcessRuleId, enabled: bool) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        let model = rt.model();
+        let old = model
+            .process_routing
+            .rules
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.user_enabled)
+            .ok_or("规则已不存在")?;
+        let outcome = rt
+            .mutate_process_routing(|pr| {
+                if let Some(r) = pr.rules.iter_mut().find(|r| r.id == id) {
+                    r.user_enabled = enabled;
+                }
+            })
+            .await
+            .map_err(validation)?;
+        let revert = |pr: &mut ProcessRouting| {
+            if let Some(r) = pr.rules.iter_mut().find(|r| r.id == id && r.user_enabled == enabled) {
+                r.user_enabled = old;
+            }
+        };
+        if let Err(e) = reload_ok(&outcome) {
+            let _ = rt.mutate_process_routing(revert).await;
+            return Err(e);
+        }
+        if !procroute_running() {
+            return Ok(());
+        }
+        let confirmed = confirm_or_revert(rt, revert).await?;
+        if confirmed {
+            Ok(())
+        } else {
+            let what = if enabled { "启用" } else { "停用" };
+            Err(format!("规则{what}未能确认生效，已恢复原状态，请检查组件状态后重试"))
+        }
+    }
+}
+
+/// How long the AI apps page waits for the core / the component to come up.
+const CORE_WAIT: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10) };
+const COMPONENT_WAIT: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10) };
+/// Same bound as `confirm_or_revert`.
+const CONFIRM_WAIT: Duration = Duration::from_secs(5);
+
+/// Polls `ready` every 100 ms until it holds or `timeout` passes.
+async fn wait_until(timeout: Duration, ready: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if ready() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Undoes a whole-routing change, unless something else changed it since.
+pub(crate) fn revert_to(before: ProcessRouting, after: ProcessRouting) -> impl FnOnce(&mut ProcessRouting) {
+    move |pr| {
+        if *pr == after {
+            *pr = before;
+        }
+    }
+}
+
+/// Simple-mode ids of rules that enabling an AI app deleted.
+fn prune_simple_ids(prefs: &mut UiPreferences, deleted: &[ProcessRuleId]) {
+    prefs.managed_rules.retain(|id| !deleted.contains(id));
+    prefs.selected_apps.retain(|id| !deleted.contains(id));
+}
+
+/// At startup, an enabled AI app needs the core even without auto connect.
+pub(crate) fn ai_needs_core(model: &Model) -> bool {
+    model.process_routing.rules.iter().any(|r| r.ai_app.is_some() && r.user_enabled)
+}
+
+async fn ensure_core(rt: &Runtime) -> Result<(), String> {
+    if matches!(rt.status().core, CoreState::Stopped | CoreState::Crashed { .. }) {
+        rt.restart_core().await;
+    }
+    if wait_until(CORE_WAIT, || matches!(rt.status().core, CoreState::Running)).await {
+        Ok(())
+    } else {
+        Err("内核未能启动，请查看日志".into())
+    }
+}
+
+async fn ensure_component() -> Result<(), String> {
+    use crate::procroute::client::{self, ComponentState};
+    match client::status().component {
+        ComponentState::Running => return Ok(()),
+        ComponentState::NotInstalled | ComponentState::NeedsUpdate => {
+            crate::procroute::service_command(crate::procroute::elevate::ElevatedCmd::Install).await?
+        }
+        ComponentState::Stopped => client::retry().await?,
+        ComponentState::OwnedByOtherUser => {
+            return Err("应用分流组件被其他 Windows 用户占用，请在该用户下卸载后重试".into())
+        }
+        ComponentState::Error { message } => return Err(format!("应用分流组件出错：{message}")),
+    }
+    if wait_until(COMPONENT_WAIT, procroute_running).await {
+        Ok(())
+    } else {
+        Err("应用分流组件未能启动，请在进程分流页查看组件状态".into())
+    }
+}
+
+/// Commits `f` to the process routing; a failed reload or (while the
+/// component runs) a missing confirmation restores the whole routing.
+async fn apply_confirmed(rt: &Runtime, f: impl FnOnce(&mut ProcessRouting), failed: &str) -> Result<(), String> {
+    let before = rt.model().process_routing.clone();
+    let outcome = rt.mutate_process_routing(f).await.map_err(validation)?;
+    let revert = revert_to(before, rt.model().process_routing.clone());
+    if let Err(e) = reload_ok(&outcome) {
+        let _ = rt.mutate_process_routing(revert).await;
+        return Err(e);
+    }
+    if procroute_running() && !confirm_or_revert(rt, revert).await? {
+        return Err(format!("{failed}未能确认生效，已恢复原状态，请检查组件状态后重试"));
+    }
+    Ok(())
+}
+
+impl Desktop {
+    /// Makes sure the core runs and the component is Running, then applies
+    /// `rules::enable` and waits for the service to confirm; on failure the
+    /// whole process routing is restored.
+    pub async fn enable_ai_app(&self, rt: &Runtime, app: &CatalogApp, node: NodeRef) -> Result<(), String> {
+        let node_ok = || resolve(&rt.model(), &node).is_some();
+        // Checked first so a stale node fails before any UAC prompt or wait.
+        if !node_ok() {
+            return Err("节点已失效，请重新选择".into());
+        }
+        // Outside the lock: a UAC prompt and the waits must not block the
+        // proxy monitor or exit. Both are idempotent and touch no Desktop state.
+        ensure_core(rt).await?;
+        ensure_component().await?;
+        let _guard = self.operation.lock().await;
+        if !node_ok() {
+            return Err("节点已失效，请重新选择".into());
+        }
+        let mut deleted = vec![];
+        apply_confirmed(rt, |pr| deleted = ai_rules::enable(pr, app, node), "AI 应用代理").await?;
+        if deleted.is_empty() {
+            return Ok(());
+        }
+        let mut p = self.prefs();
+        prune_simple_ids(&mut p, &deleted);
+        self.persist(p).map(|_| ())
+    }
+
+    /// `rules::disable`, then waits for the service to confirm; on failure restores.
+    pub async fn disable_ai_app(&self, rt: &Runtime, app_id: &str) -> Result<(), String> {
+        let _guard = self.operation.lock().await;
+        if ai_rules::ai_rule(&rt.model().process_routing, app_id).is_none() {
+            return Ok(());
+        }
+        apply_confirmed(rt, |pr| ai_rules::disable(pr, app_id), "AI 应用停用").await
+    }
+
+    /// Before "启动": ensure the core and component are running.
+    /// The app's AI rule must already be enabled.
+    pub async fn prepare_ai_app(&self, rt: &Runtime, app_id: &str) -> Result<(), String> {
+        let ai_enabled = || ai_rules::ai_rule(&rt.model().process_routing, app_id).is_some_and(|r| r.user_enabled);
+        if !ai_enabled() {
+            return Err("请先选择节点".into());
+        }
+        // Outside the lock, as in `enable_ai_app`.
+        ensure_core(rt).await?;
+        ensure_component().await?;
+        let _guard = self.operation.lock().await;
+        if !ai_enabled() {
+            return Err("请先选择节点".into());
+        }
+        // A core or component that just came up: the service may still hold
+        // fallback targets. Returns at once when already confirmed.
+        crate::procroute::client::runtime_changed();
+        if !wait_until(CONFIRM_WAIT, || crate::procroute::client::current_rules_confirmed(rt)).await {
+            return Err("规则未确认生效，请检查组件状态后重试".into());
+        }
+        Ok(())
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn change_process_node(dt: Dt<'_>, rt: Rt<'_>, id: ProcessRuleId, node: NodeRef) -> Result<(), String> {
+    dt.change_process_node(&rt, id, node).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_process_rule_confirmed(
+    dt: Dt<'_>,
+    rt: Rt<'_>,
+    rule: ProcessRule,
+) -> Result<Option<ApplyOutcome>, RuleSaveError> {
+    dt.save_process_rule_confirmed(&rt, rule).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_process_rule_enabled(dt: Dt<'_>, rt: Rt<'_>, id: ProcessRuleId, enabled: bool) -> Result<(), String> {
+    dt.set_process_rule_enabled(&rt, id, enabled).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn enable_ai_app(
+    apps: tauri::State<'_, Arc<AiApps>>,
+    dt: Dt<'_>,
+    rt: Rt<'_>,
+    app_id: String,
+    node: NodeRef,
+) -> Result<(), String> {
+    let app = crate::aiapps::commands::find_app(&apps, &app_id)?;
+    dt.enable_ai_app(&rt, &app, node).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn disable_ai_app(dt: Dt<'_>, rt: Rt<'_>, app_id: String) -> Result<(), String> {
+    dt.disable_ai_app(&rt, &app_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn log_tail_starts_at_a_complete_record_and_preserves_utf8() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("mihomo.log");
+        let last = "time=\"2026-10-30T20:00:00+08:00\" level=info msg=\"启动成功\"\n";
+        std::fs::write(&path, format!("很长的旧错误详情\n{last}")).unwrap();
+        assert_eq!(read_log_tail(&path, last.len() as u64).unwrap(), last);
+        assert_eq!(read_log_tail(&path, last.len() as u64 + 5).unwrap(), last);
+        assert_eq!(read_log_tail(&path, 3).unwrap(), "");
+        assert_eq!(read_log_tail(&path, 0).unwrap(), "");
+    }
+    #[test]
+    fn log_tail_keeps_short_files_and_handles_missing_files() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("mihomo.log");
+        assert_eq!(read_log_tail(&path, 65536).unwrap(), "");
+        std::fs::write(&path, "启动成功\n").unwrap();
+        assert_eq!(read_log_tail(&path, 65536).unwrap(), "启动成功\n");
+    }
+    #[test]
+    fn legacy_install_keeps_full_interface() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("state.json"), "{}").unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert_eq!(dt.prefs().mode, Some(InterfaceMode::Full));
+    }
+    #[test]
+    fn old_preferences_file_defaults_taskbar_status_to_on_and_rotate() {
+        let p: UiPreferences = serde_json::from_str(r#"{"close_to_tray":true}"#).unwrap();
+        assert!(p.taskbar_status.enabled);
+        assert_eq!(p.taskbar_status.mode, TaskbarStatusMode::Rotate);
+        assert_eq!(p.taskbar_status.traffic, TaskbarTraffic::Values);
+        let p: UiPreferences = serde_json::from_str(r#"{"taskbar_status":{"enabled":false}}"#).unwrap();
+        assert_eq!(p.taskbar_status.traffic, TaskbarTraffic::Values);
+    }
+    #[tokio::test]
+    async fn taskbar_status_preferences_survive_a_restart() {
+        let td = tempfile::tempdir().unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert!(dt.taskbar_status().enabled);
+        let mut p = dt.prefs();
+        p.taskbar_status.mode = TaskbarStatusMode::Fixed(ListenerId("l1".into()));
+        dt.save_preferences(p).await.unwrap();
+        dt.disable_taskbar_status().await.unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert!(!dt.taskbar_status().enabled);
+        assert_eq!(dt.taskbar_status().mode, TaskbarStatusMode::Fixed(ListenerId("l1".into())));
+    }
+    fn ai_app(id: &str, procs: &[&str]) -> CatalogApp {
+        CatalogApp {
+            id: id.into(),
+            name: id.to_uppercase(),
+            icon: String::new(),
+            download_url: String::new(),
+            test_url: String::new(),
+            on_fault: FaultPolicy::Block,
+            install: vec![],
+            processes: procs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn manual_node() -> NodeRef {
+        NodeRef::Manual { manual_id: ManualNodeId("n".into()) }
+    }
+    #[test]
+    fn enable_reverts_whole_routing_on_failure() {
+        let before = ProcessRouting {
+            rules: vec![ProcessRule {
+                id: ProcessRuleId("manual".into()),
+                processes: vec![ProcessEntry::name("ChatGPT.exe"), ProcessEntry::name("notepad.exe")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut after = before.clone();
+        crate::aiapps::rules::enable(&mut after, &ai_app("chatgpt", &["ChatGPT.exe"]), manual_node());
+        let mut pr = after.clone();
+        revert_to(before.clone(), after.clone())(&mut pr);
+        assert_eq!(pr, before);
+        assert!(crate::aiapps::rules::ai_rule(&pr, "chatgpt").is_none());
+        assert_eq!(pr.rules[0].processes.len(), 2);
+        // Changed elsewhere since: left alone.
+        let mut elsewhere = after.clone();
+        elsewhere.exit_prompt = !elsewhere.exit_prompt;
+        let expected = elsewhere.clone();
+        revert_to(before, after)(&mut elsewhere);
+        assert_eq!(elsewhere, expected);
+    }
+    #[tokio::test]
+    async fn enable_rejects_a_missing_node_and_leaves_routing_unchanged() {
+        let td = tempfile::tempdir().unwrap();
+        let rt = crate::commands::tests::runtime(&td);
+        let dt = Desktop::open(td.path().into()).unwrap();
+        let before = rt.model().process_routing;
+        let err = dt
+            .enable_ai_app(&rt, &ai_app("chatgpt", &["ChatGPT.exe"]), manual_node())
+            .await
+            .unwrap_err();
+        assert_eq!(err, "节点已失效，请重新选择");
+        assert_eq!(rt.model().process_routing, before);
+    }
+    #[tokio::test]
+    async fn enable_fails_without_core_and_leaves_routing_unchanged() {
+        let td = tempfile::tempdir().unwrap();
+        let rt = crate::commands::tests::runtime(&td);
+        let dt = Desktop::open(td.path().into()).unwrap();
+        rt.mutate(|m| {
+            m.manual_nodes.push(ManualNode {
+                id: ManualNodeId("n".into()),
+                name: "n".into(),
+                groups: vec![],
+                kind: ManualNodeKind::Proxy { raw: serde_json::json!({"type": "ss", "name": "n"}) },
+            })
+        })
+        .await
+        .unwrap();
+        let before = rt.model().process_routing;
+        let err = dt
+            .enable_ai_app(&rt, &ai_app("chatgpt", &["ChatGPT.exe"]), manual_node())
+            .await
+            .unwrap_err();
+        assert_eq!(err, "内核未能启动，请查看日志");
+        assert_eq!(rt.model().process_routing, before);
+    }
+    #[tokio::test]
+    async fn prepare_requires_an_enabled_ai_rule() {
+        let td = tempfile::tempdir().unwrap();
+        let rt = crate::commands::tests::runtime(&td);
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert_eq!(dt.prepare_ai_app(&rt, "chatgpt").await.unwrap_err(), "请先选择节点");
+        // A disabled AI rule (no node needed while it is off).
+        rt.mutate_process_routing(|pr| {
+            pr.rules.push(ProcessRule {
+                ai_app: Some("chatgpt".into()),
+                processes: vec![ProcessEntry::name("ChatGPT.exe")],
+                user_enabled: false,
+                ..Default::default()
+            });
+        })
+        .await
+        .unwrap();
+        assert!(crate::aiapps::rules::ai_rule(&rt.model().process_routing, "chatgpt").is_some());
+        assert_eq!(dt.prepare_ai_app(&rt, "chatgpt").await.unwrap_err(), "请先选择节点");
+    }
+    #[test]
+    fn prune_simple_ids_removes_deleted_rules() {
+        let (a, b) = (ProcessRuleId("a".into()), ProcessRuleId("b".into()));
+        let mut p = UiPreferences {
+            managed_rules: vec![a.clone(), b.clone()],
+            selected_apps: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        prune_simple_ids(&mut p, std::slice::from_ref(&a));
+        assert_eq!(p.managed_rules, vec![b.clone()]);
+        assert_eq!(p.selected_apps, vec![b]);
+    }
+    #[test]
+    fn startup_core_needed_only_for_enabled_ai_rules() {
+        let rule = |ai: bool, enabled: bool| ProcessRule {
+            ai_app: ai.then(|| "chatgpt".to_string()),
+            user_enabled: enabled,
+            processes: vec![ProcessEntry::name("ChatGPT.exe")],
+            ..Default::default()
+        };
+        let model = |r: ProcessRule| {
+            let mut m = Model::default();
+            m.process_routing.rules = vec![r];
+            m
+        };
+        assert!(ai_needs_core(&model(rule(true, true))));
+        assert!(!ai_needs_core(&model(rule(true, false))));
+        assert!(!ai_needs_core(&model(rule(false, true))));
+        assert!(!ai_needs_core(&Model::default()));
+    }
+    #[tokio::test]
+    async fn ai_reset_prompt_preference_is_saved() {
+        let td = tempfile::tempdir().unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        let p = UiPreferences { skip_ai_reset_prompt: true, ..dt.prefs() };
+        dt.save_preferences(p).await.unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert!(dt.prefs().skip_ai_reset_prompt);
+    }
+    #[test]
+    fn new_install_asks_once_and_saves_mode() {
+        let td = tempfile::tempdir().unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert_eq!(dt.prefs().mode, None);
+        let mut p = dt.prefs();
+        p.mode = Some(InterfaceMode::Simple);
+        dt.persist(p).unwrap();
+        let dt = Desktop::open(td.path().into()).unwrap();
+        assert_eq!(dt.prefs().mode, Some(InterfaceMode::Simple));
+    }
+}
