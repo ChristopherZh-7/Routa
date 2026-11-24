@@ -1,6 +1,7 @@
 import { ListenerNodeDialog } from "./ListenerNodeDialog";
 import { fieldErrors, type FieldErrors } from "../lib/validation";
 import { HIDDEN_PORT_MAX, HIDDEN_PORT_MIN } from "../lib/hidden";
+import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import {
   Alert,
   Box,
@@ -9,12 +10,14 @@ import {
   DialogContent,
   DialogTitle,
   FormControlLabel,
+  IconButton,
   MenuItem,
   Stack,
   Switch,
   TextField,
   ToggleButton,
   ToggleButtonGroup,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import { useState } from "react";
@@ -29,6 +32,7 @@ import type {
   ExitKind,
   GroupStrategy,
   Listener,
+  ListenerRouting,
   ListenerType,
   NodeRef,
   PortRule,
@@ -53,6 +57,13 @@ function proposePort(existing: Listener[]) {
   for (let p = 1024; p <= 65535; p++) if (!used.has(p) && !inHidden(p)) return p;
   return 7881;
 }
+export function defaultRouting(): ListenerRouting {
+  return {
+    bypass_cn: true,
+    rules: [],
+    unmatched: "Proxy",
+  };
+}
 export function newListener(existing: Listener[]): Listener {
   return {
     id: crypto.randomUUID(),
@@ -63,7 +74,23 @@ export function newListener(existing: Listener[]): Listener {
     auth: null,
     exit: null,
     user_enabled: true,
+    routing: defaultRouting(),
   };
+}
+const PRIVATE_CIDRS: [string, number][] = [
+  ["127.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["172.16.0.0", 12],
+  ["192.168.0.0", 16],
+  ["100.64.0.0", 10],
+  ["169.254.0.0", 16],
+];
+function ipv4InCidr(input: string, base: string, bits: number) {
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(input)) return false;
+  if (input.split(".").some((n) => Number(n) > 255)) return false;
+  const num = (s: string) =>
+    s.split(".").reduce((a, b) => (a * 256 + Number(b)) >>> 0, 0);
+  return bits === 0 || num(input) >>> (32 - bits) === num(base) >>> (32 - bits);
 }
 const actions: [RuleAction, string][] = [
   ["Proxy", "代理"],
@@ -120,6 +147,9 @@ export function ListenerDialog({
       ? target.kind.Group
       : { strategy: "UrlTest" as GroupStrategy, members: [], selected: null },
   );
+  const [bypassCn, setBypassCn] = useState(
+    l.routing ? Boolean(l.routing.bypass_cn) : true,
+  );
   const [rules, setRules] = useState<PortRule[]>(l.routing?.rules ?? []);
   const [unmatched, setUnmatched] = useState<RuleAction>(
     l.routing?.unmatched ?? "Proxy",
@@ -175,7 +205,10 @@ export function ListenerDialog({
           ? "::1"
           : "127.0.0.1",
       port: p,
-      routing: mode === "rules" ? { rules, unmatched } : null,
+      routing:
+        mode === "rules"
+          ? { ...(bypassCn ? { bypass_cn: true } : {}), rules, unmatched }
+          : null,
     };
     try {
       await save.mutateAsync(next, { ...target, kind: destination });
@@ -194,17 +227,41 @@ export function ListenerDialog({
       if (r.matcher === "DomainSuffix")
         return input === v || input.endsWith(`.${v}`);
       const [ip, prefix] = v.split("/");
-      const num = (s: string) =>
-        s.split(".").reduce((a, b) => (a * 256 + Number(b)) >>> 0, 0);
-      const bits = Number(prefix);
-      return (
-        /^\d+\.\d+\.\d+\.\d+$/.test(input) &&
-        (bits === 0 || num(input) >>> (32 - bits) === num(ip) >>> (32 - bits))
-      );
+      return ipv4InCidr(input, ip, Number(prefix));
     });
-    setProbeResult(
-      `${match ? "匹配 " + match.value : "未匹配规则"} → ${actions.find(([a]) => a === (match?.action ?? unmatched))?.[1]}`,
-    );
+    const labelOf = (a: RuleAction) => actions.find(([x]) => x === a)?.[1];
+    if (match) {
+      setProbeResult(`匹配 ${match.value} → ${labelOf(match.action)}`);
+      return;
+    }
+    if (bypassCn && input) {
+      const isPrivateHost =
+        input === "localhost" ||
+        [".local", ".lan", ".internal", ".home.arpa"].some((s) =>
+          input.endsWith(s),
+        );
+      const isPrivateIp = PRIVATE_CIDRS.some(([ip, bits]) =>
+        ipv4InCidr(input, ip, bits),
+      );
+      if (isPrivateHost || isPrivateIp) {
+        setProbeResult("匹配内置局域网规则 → 直连");
+        return;
+      }
+      if (
+        input === "cn" ||
+        input.endsWith(".cn") ||
+        input.endsWith(".中国") ||
+        input.endsWith(".xn--fiqs8s")
+      ) {
+        setProbeResult("匹配内置大陆规则 → 直连");
+        return;
+      }
+      setProbeResult(
+        `未匹配自定义规则（若属大陆地址则直连，否则 → ${labelOf(unmatched)}）`,
+      );
+      return;
+    }
+    setProbeResult(`未匹配规则 → ${labelOf(unmatched)}`);
   };
   return (
     <>
@@ -344,6 +401,27 @@ export function ListenerDialog({
             )}
             {mode === "rules" && (
               <>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                  <FormControlLabel
+                    sx={{ mr: 0 }}
+                    label="绕过大陆与局域网"
+                    control={
+                      <Switch
+                        checked={bypassCn}
+                        onChange={(_, v) => setBypassCn(v)}
+                      />
+                    }
+                  />
+                  <Tooltip title="私有地址与中国大陆域名、IP 直连，排在自定义规则之后、未匹配去向之前。">
+                    <IconButton
+                      size="small"
+                      aria-label="绕过大陆与局域网说明"
+                      sx={{ p: 0.25 }}
+                    >
+                      <InfoOutlined sx={{ fontSize: 16 }} />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
                 <Typography variant="subtitle2">按顺序匹配</Typography>
                 {rules.map((r, i) => (
                   <Box

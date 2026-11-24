@@ -210,6 +210,11 @@ describe("newListener", () => {
       ]).port,
     ).toBe(7006);
     expect(newListener([]).listen).toBe("127.0.0.1");
+    expect(newListener([]).routing).toEqual({
+      bypass_cn: true,
+      rules: [],
+      unmatched: "Proxy",
+    });
   });
   it("never proposes a port above 65535", () =>
     expect(
@@ -224,5 +229,131 @@ describe("newListener hidden range", () => {
     expect(newListener([{ ...listener, port: 37799 }]).port).toBe(38000);
     expect(newListener([{ ...listener, port: 37800 }]).port).toBe(38000);
     expect(newListener([{ ...listener, port: 37999 }]).port).toBe(38000);
+  });
+});
+describe("ListenerDialog default CN & LAN bypass", () => {
+  beforeEach(() => {
+    vi.mocked(commands.getModel).mockResolvedValue({
+      ...model,
+      manual_nodes: [
+        {
+          id: "m1",
+          name: "SG 01",
+          groups: [],
+          kind: { Proxy: { raw: { name: "SG 01", type: "ss", server: "1.1.1.1", port: 443 } } },
+        },
+      ],
+      exits: [
+        {
+          id: "proxy-old",
+          name: "代理-old",
+          interface: null,
+          kind: { Node: { node: { manual_id: "m1" } } },
+        },
+      ],
+      listeners: [
+        {
+          id: "old",
+          name: "雷霆",
+          listener_type: "Mixed",
+          listen: "127.0.0.1",
+          port: 7882,
+          auth: null,
+          exit: "proxy-old",
+          user_enabled: true,
+          routing: null,
+        },
+      ],
+    });
+    vi.mocked(commands.getStatus).mockResolvedValue({
+      interfaces: [],
+      delays: {},
+    } as never);
+    vi.mocked(invoke)
+      .mockReset()
+      .mockResolvedValue({ NotRunning: { error: "" } });
+  });
+
+  it("opens newListener in rules mode with CN & LAN bypass enabled by default", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <ListenerDialog
+            listener={{ ...newListener([]), id: "new1", name: "新代理" }}
+            initialNode={{ manual_id: "m1" }}
+            onClose={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await modelLoaded();
+    const bypassSwitch = screen.getByRole("switch", { name: "绕过大陆与局域网" });
+    expect(bypassSwitch).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "save_proxy",
+        expect.objectContaining({
+          l: expect.objectContaining({
+            id: "new1",
+            routing: { bypass_cn: true, rules: [], unmatched: "Proxy" },
+          }),
+          target: expect.objectContaining({
+            kind: { Node: { node: { manual_id: "m1" } } },
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("keeps existing uniform-forwarding proxies untouched until switched to rules mode", async () => {
+    const existing: Listener = {
+      id: "old",
+      name: "雷霆",
+      listener_type: "Mixed",
+      listen: "127.0.0.1",
+      port: 7882,
+      auth: null,
+      exit: "proxy-old",
+      user_enabled: true,
+      routing: null,
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["model"], await commands.getModel());
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <ListenerDialog listener={existing} onClose={vi.fn()} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await modelLoaded();
+    expect(screen.queryByRole("switch", { name: "绕过大陆与局域网" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "规则分流" }));
+    expect(screen.getByRole("switch", { name: "绕过大陆与局域网" })).toBeChecked();
+    fireEvent.click(screen.getByText("验证规则"));
+    fireEvent.change(screen.getByLabelText("域名或 IPv4 地址"), {
+      target: { value: "192.168.1.1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "验证" }));
+    expect(screen.getByText("匹配内置局域网规则 → 直连")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("域名或 IPv4 地址"), {
+      target: { value: "ustc.edu.cn" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "验证" }));
+    expect(screen.getByText("匹配内置大陆规则 → 直连")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "save_proxy",
+        expect.objectContaining({
+          l: expect.objectContaining({
+            id: "old",
+            routing: { bypass_cn: true, rules: [], unmatched: "Proxy" },
+          }),
+        }),
+      ),
+    );
   });
 });

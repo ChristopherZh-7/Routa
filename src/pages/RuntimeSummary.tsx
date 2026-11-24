@@ -338,7 +338,7 @@ export function RuntimeSummary() {
   if (onboarding === null && m && desktop) setOnboarding(!hasProxy);
   const quickStart = async () => {
     if (!m) return;
-    const l = { ...newListener(visibleListeners(m)), name: "直连" };
+    const l = { ...newListener(visibleListeners(m)), name: "直连", routing: null };
     await saveProxy.mutateAsync(l, { id: `proxy-${l.id}`, name: `代理-${l.id}`, interface: null, kind: "Direct" });
     await bind.mutateAsync(l.id);
   };

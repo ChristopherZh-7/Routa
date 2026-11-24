@@ -201,8 +201,21 @@ pub struct Listener {
 /// Per-port routing; None preserves legacy uniform forwarding.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub struct ListenerRouting {
+    /// 内置分流：私有地址与中国大陆域名/IP 直连（排在自定义规则之后、未匹配去向之前）。
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub bypass_cn: bool,
     pub rules: Vec<PortRule>,
     pub unmatched: RuleAction,
+}
+
+impl ListenerRouting {
+    pub fn default_bypass() -> Self {
+        Self {
+            bypass_cn: true,
+            rules: Vec::new(),
+            unmatched: RuleAction::Proxy,
+        }
+    }
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub enum RuleAction { Proxy, Direct, Reject }
@@ -565,6 +578,18 @@ mod tests {
         let e = Exit { hidden: true, ..Exit::default() };
         let back: Exit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert!(back.hidden);
+    }
+
+    #[test]
+    fn listener_routing_bypass_cn_defaults_false_for_legacy_and_round_trips() {
+        let legacy: ListenerRouting = serde_json::from_str(r#"{"rules":[],"unmatched":"Direct"}"#).unwrap();
+        assert!(!legacy.bypass_cn);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("bypass_cn"));
+        let preset = ListenerRouting::default_bypass();
+        assert!(preset.bypass_cn);
+        assert_eq!(preset.unmatched, RuleAction::Proxy);
+        let back: ListenerRouting = serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
+        assert_eq!(back, preset);
     }
 
     #[test]

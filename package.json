@@ -1,7 +1,7 @@
 {
   "name": "routa",
   "private": true,
-  "version": "0.8.5",
+  "version": "0.8.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,6 +11,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "fetch-mihomo": "node scripts/fetch-mihomo.mjs",
+    "fetch-rules": "node scripts/fetch-rules.mjs",
     "fetch-windivert": "node scripts/fetch-windivert.mjs",
     "build-procsvc": "node scripts/build-procsvc.mjs",
     "build-proxybridge": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-proxybridge.ps1",

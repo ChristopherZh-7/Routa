@@ -63,7 +63,7 @@ mod tests {
             serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         let raw = conf["plugins"]["updater"].clone();
         let config: tauri_plugin_updater::Config = serde_json::from_value(raw).unwrap();
-        let base = "https://github.com/c0010c/Routa/releases/latest/download";
+        let base = "https://github.com/ChristopherZh-7/Routa/releases/latest/download";
         let got: Vec<String> = config.endpoints.iter().map(|u| u.to_string()).collect();
         assert_eq!(got, vec![
             format!("https://gh-proxy.org/{base}/latest-proxy.json"),

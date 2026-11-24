@@ -769,7 +769,11 @@ export type ListenerId = string
 /**
  * Per-port routing; None preserves legacy uniform forwarding.
  */
-export type ListenerRouting = { rules: PortRule[]; unmatched: RuleAction }
+export type ListenerRouting = { 
+/**
+ * 内置分流：私有地址与中国大陆域名/IP 直连（排在自定义规则之后、未匹配去向之前）。
+ */
+bypass_cn?: boolean; rules: PortRule[]; unmatched: RuleAction }
 export type ListenerStatus = "Active" | "DisabledByUser" | "NoExit" | { ExitBroken: { exit_status: ExitStatus } }
 export type ListenerType = "Mixed" | "Http" | "Socks"
 /**

@@ -124,6 +124,7 @@ fn check_failure_message(output: &str, code: Option<i32>) -> String {
 
 /// Runs `bin -t -d workdir -f config` (no window, killed after 15 s).
 pub async fn check_config_with(bin: &Path, workdir: &Path, config: &Path) -> Result<(), CheckError> {
+    let _ = crate::config_gen::ensure_builtin_rules(workdir);
     let mut cmd = Command::new(bin);
     cmd.arg("-t")
         .arg("-d")
@@ -299,6 +300,7 @@ impl CoreProcess {
                 "config must be inside the mihomo workdir (spike S5)",
             ));
         }
+        let _ = crate::config_gen::ensure_builtin_rules(workdir);
         let log = workdir.join("mihomo.log");
         rotate_log(&log, LOG_ROTATE_BYTES);
         let mut cmd = Command::new(bin);

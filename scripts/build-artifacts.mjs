@@ -40,6 +40,7 @@ export const frontendSources = () => treeHash(root, [
 export const guiSources = () => treeHash(root, [
   "src-tauri/src", "src-tauri/build.rs", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock",
   "src-tauri/tauri.conf.json", "src-tauri/capabilities", "src-tauri/icons", "src-tauri/nsis",
+  "presets",
 ]);
 export const frontendFiles = () => treeHash(join(root, "dist"), ["."], ["routa-frontend.json"]);
 export const protocolVersion = () => Number(readFileSync(join(root, "src-tauri/procsvc-proto/src/lib.rs"), "utf8")

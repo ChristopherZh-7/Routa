@@ -240,7 +240,12 @@ pub struct ConnectionInfo {
 
 fn connection_node_names(model: &Model) -> HashMap<String, String> {
     use crate::model::{ExitKind, NodeRef, expand, manual_proxy_name};
-    let mut names = HashMap::from([("DIRECT".into(), "直连".into())]);
+    let mut names = HashMap::from([("DIRECT".into(), "直连".into()), ("REJECT".into(), "阻断".into())]);
+    for l in &model.listeners {
+        if l.routing.is_some() && !l.hidden {
+            names.insert(format!("__direct_{}", l.id.0), "直连".into());
+        }
+    }
     for n in &model.manual_nodes {
         names.insert(manual_proxy_name(n), n.name.clone());
     }

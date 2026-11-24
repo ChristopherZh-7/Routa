@@ -334,6 +334,7 @@ impl Desktop {
             }
             let mut l = Listener::new_default(name, 7881);
             l.listen = "127.0.0.1".into();
+            l.routing = Some(ListenerRouting::default_bypass());
             l
         };
         if listener.listener_type == ListenerType::Http || listener.auth.is_some() {
@@ -1393,5 +1394,16 @@ mod tests {
         dt.persist(p).unwrap();
         let dt = Desktop::open(td.path().into()).unwrap();
         assert_eq!(dt.prefs().mode, Some(InterfaceMode::Simple));
+    }
+    #[tokio::test]
+    async fn fresh_install_default_listener_enables_builtin_cn_bypass() {
+        let td = tempfile::tempdir().unwrap();
+        let rt = crate::commands::tests::runtime(&td);
+        let dt = Desktop::open(td.path().into()).unwrap();
+        dt.initialize(&rt).await.unwrap();
+        let m = rt.model();
+        assert_eq!(m.listeners.len(), 1);
+        assert_eq!(m.listeners[0].name, "默认监听器");
+        assert_eq!(m.listeners[0].routing, Some(ListenerRouting::default_bypass()));
     }
 }

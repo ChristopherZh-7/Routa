@@ -1,6 +1,6 @@
 fn main() {
     // tauri CLI 的 beforeBuildCommand 会重新构建组件；直接 cargo build 也必须拒绝旧组件。
-    for path in ["src", "icons", "capabilities", "nsis", "procsvc", "procsvc-proto", "Cargo.toml", "Cargo.lock", "binaries", "../src", "../public", "../dist", "../scripts", "../package.json", "../pnpm-lock.yaml", "../vite.config.ts", "../tsconfig.json", "../tsconfig.node.json", "../index.html"] {
+    for path in ["src", "icons", "capabilities", "nsis", "procsvc", "procsvc-proto", "Cargo.toml", "Cargo.lock", "binaries", "../presets", "../src", "../public", "../dist", "../scripts", "../package.json", "../pnpm-lock.yaml", "../vite.config.ts", "../tsconfig.json", "../tsconfig.node.json", "../index.html"] {
         println!("cargo:rerun-if-changed={path}");
     }
     if std::env::var("PROFILE").as_deref() == Ok("release") {

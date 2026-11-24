@@ -87,7 +87,9 @@ pub fn drop_old_process_rules(raw: &mut serde_json::Value) -> usize {
 
 impl Store {
     pub fn open(dir: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(dir.join(CORE_DIR))?;
+        let core_dir = dir.join(CORE_DIR);
+        fs::create_dir_all(&core_dir)?;
+        crate::config_gen::ensure_builtin_rules(&core_dir)?;
         Ok(Self { dir })
     }
 

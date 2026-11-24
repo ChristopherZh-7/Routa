@@ -12,6 +12,60 @@ use crate::model::health::{ExitHealth, ExitStatus, Health, ListenerStatus};
 use crate::model::*;
 use crate::netif::NetInterface;
 
+const BUILTIN_RULES_DIR: &str = "rules";
+const PROVIDER_PRIVATE_DOMAIN: &str = "__routa_private_domain";
+const PROVIDER_CN_DOMAIN: &str = "__routa_cn_domain";
+const PROVIDER_PRIVATE_IP: &str = "__routa_private_ip";
+const PROVIDER_CN_IP: &str = "__routa_cn_ip";
+
+const BUILTIN_RULE_FILES: [(&str, &[u8]); 4] = [
+    ("geosite-private.mrs", include_bytes!("../../../presets/rules/geosite-private.mrs")),
+    ("geosite-cn.mrs", include_bytes!("../../../presets/rules/geosite-cn.mrs")),
+    ("geoip-private.mrs", include_bytes!("../../../presets/rules/geoip-private.mrs")),
+    ("geoip-cn.mrs", include_bytes!("../../../presets/rules/geoip-cn.mrs")),
+];
+
+/// Materializes embedded MRS rule sets into `<workdir>/rules/` so `mihomo -t`
+/// and runtime reloads work completely offline.
+pub fn ensure_builtin_rules(workdir: &std::path::Path) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = workdir.join(BUILTIN_RULES_DIR);
+    std::fs::create_dir_all(&dir)?;
+    for (name, bytes) in BUILTIN_RULE_FILES {
+        let dest = dir.join(name);
+        if std::fs::read(&dest).ok().as_deref() == Some(bytes) {
+            continue;
+        }
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+fn builtin_rule_providers() -> Value {
+    let entry = |behavior: &str, file: &str| {
+        map(vec![
+            ("type", s("file")),
+            ("behavior", s(behavior)),
+            ("format", s("mrs")),
+            ("path", s(&format!("./{BUILTIN_RULES_DIR}/{file}"))),
+        ])
+    };
+    map(vec![
+        (PROVIDER_PRIVATE_DOMAIN, entry("domain", "geosite-private.mrs")),
+        (PROVIDER_CN_DOMAIN, entry("domain", "geosite-cn.mrs")),
+        (PROVIDER_PRIVATE_IP, entry("ipcidr", "geoip-private.mrs")),
+        (PROVIDER_CN_IP, entry("ipcidr", "geoip-cn.mrs")),
+    ])
+}
+
 pub struct GenInput<'a> {
     pub model: &'a Model,
     pub health: &'a Health,
@@ -435,6 +489,7 @@ pub fn generate(input: &GenInput) -> Generated {
     }
 
     let mut sub_rules = Mapping::new();
+    let mut use_builtin_rules = false;
     let mut listeners = Vec::new();
     let mut plan = BTreeMap::new();
     for l in &model.listeners {
@@ -457,12 +512,14 @@ pub fn generate(input: &GenInput) -> Generated {
             let user = map(vec![("username", s(&a.username)), ("password", s(&a.password))]);
             own.push(("users", Value::Sequence(vec![user])));
         }
+        // Hidden process-routing / AI-app listeners always forward 100% of traffic to their chosen node.
+        let effective_routing = l.routing.as_ref().filter(|_| !l.hidden);
         let mut fingerprint_fields = own.clone();
-        fingerprint_fields.push(("routing", json_to_yaml(&serde_json::to_value(&l.routing).expect("routing"))));
+        fingerprint_fields.push(("routing", json_to_yaml(&serde_json::to_value(effective_routing).expect("routing"))));
         let listener_fingerprint = hash_yaml(&map(fingerprint_fields));
         let mut entries = vec![("name", s(&l.name))];
         entries.extend(own.drain(..3));
-        if let Some(routing) = &l.routing {
+        if let Some(routing) = effective_routing {
             let alias = format!("__port_{}", l.id.0);
             let target_alias = format!("__target_{}", l.id.0);
             groups.push(map(vec![("name", s(&target_alias)), ("type", s("select")), ("proxies", Value::Sequence(vec![s(&exit.name)]))]));
@@ -475,6 +532,13 @@ pub fn generate(input: &GenInput) -> Generated {
                 let ty = match r.matcher { RuleMatch::Domain => "DOMAIN", RuleMatch::DomainSuffix => "DOMAIN-SUFFIX", RuleMatch::Ipv4Cidr => "IP-CIDR" };
                 s(&format!("{},{},{}", ty, r.value, action(&r.action)))
             }).collect();
+            if routing.bypass_cn {
+                use_builtin_rules = true;
+                rules.push(s(&format!("RULE-SET,{PROVIDER_PRIVATE_DOMAIN},{direct_alias}")));
+                rules.push(s(&format!("RULE-SET,{PROVIDER_CN_DOMAIN},{direct_alias}")));
+                rules.push(s(&format!("RULE-SET,{PROVIDER_PRIVATE_IP},{direct_alias},no-resolve")));
+                rules.push(s(&format!("RULE-SET,{PROVIDER_CN_IP},{direct_alias},no-resolve")));
+            }
             rules.push(s(&format!("MATCH,{}", action(&routing.unmatched))));
             sub_rules.insert(s(&alias), Value::Sequence(rules));
             entries.push(("rule", s(&alias)));
@@ -504,7 +568,7 @@ pub fn generate(input: &GenInput) -> Generated {
         let Some(exit) = model.exits.iter().find(|e| &e.id == exit_id) else {
             continue;
         };
-        let routed = model.listeners.iter().find(|l| l.exit.as_ref() == Some(exit_id) && l.routing.is_some());
+        let routed = model.listeners.iter().find(|l| !l.hidden && l.exit.as_ref() == Some(exit_id) && l.routing.is_some());
         let destination = routed.map(|l| ("rule", s(&format!("__port_{}", l.id.0)))).filter(|(_, name)| sub_rules.contains_key(name)).unwrap_or(("proxy", s(&exit.name)));
         listeners.push(map(vec![
             ("name", s(&format!("__fetch__{}", exit_id.0))),
@@ -516,6 +580,7 @@ pub fn generate(input: &GenInput) -> Generated {
     }
 
     let mut root: Value = serde_yaml_ng::from_str(&base_config(model.settings.controller_port, input.secret, proxies, groups, listeners)).expect("generated config");
+    if use_builtin_rules { root["rule-providers"] = builtin_rule_providers(); }
     if !sub_rules.is_empty() { root["sub-rules"] = Value::Mapping(sub_rules); }
     Generated {
         yaml: serde_yaml_ng::to_string(&root).expect("routing config"),
@@ -554,8 +619,13 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
             ("proxies", Value::Sequence(vec![s(target)])),
         ]));
     root["rules"] = Value::Sequence(vec![s("MATCH,__routa_tun__")]);
-    if let Some(l) = input.model.listeners.iter().find(|l| l.exit.as_ref() == Some(id) && l.routing.is_some()) {
-        if let Some(rules) = root.get("sub-rules").and_then(|v| v.get(format!("__port_{}", l.id.0))).cloned() { root["rules"] = rules; }
+    let routed = input.model.listeners.iter().find(|l| !l.hidden && l.exit.as_ref() == Some(id) && l.routing.is_some());
+    let mut tun_bypass_cn = false;
+    if let Some(l) = routed {
+        if let Some(rules) = root.get("sub-rules").and_then(|v| v.get(format!("__port_{}", l.id.0))).cloned() {
+            tun_bypass_cn = l.routing.as_ref().is_some_and(|r| r.bypass_cn);
+            root["rules"] = rules;
+        }
     }
     root["auto-detect-interface"] = Value::Bool(true);
     root["tun"] = map(vec![
@@ -567,15 +637,46 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
         ("auto-detect-interface", Value::Bool(true)),
         ("dns-hijack", Value::Sequence(vec![s("any:53"), s("tcp://any:53")])),
     ]);
-    root["dns"] = map(vec![
+    let mut dns_entries = vec![
         ("enable", Value::Bool(true)),
         ("enhanced-mode", s("fake-ip")),
         ("fake-ip-range", s("198.18.0.1/16")),
-        (
+    ];
+    if tun_bypass_cn {
+        dns_entries.push((
+            "fake-ip-filter",
+            Value::Sequence(vec![
+                s("+.lan"),
+                s("+.local"),
+                s("localhost.ptlogin2.qq.com"),
+                s("+.msftconnecttest.com"),
+                s("+.msftncsi.com"),
+            ]),
+        ));
+        dns_entries.push(("default-nameserver", Value::Sequence(vec![s("223.5.5.5"), s("119.29.29.29")])));
+        dns_entries.push((
+            "proxy-server-nameserver",
+            Value::Sequence(vec![s("system"), s("223.5.5.5"), s("119.29.29.29")]),
+        ));
+        dns_entries.push((
+            "direct-nameserver",
+            Value::Sequence(vec![s("system"), s("223.5.5.5"), s("119.29.29.29")]),
+        ));
+        dns_entries.push((
+            "nameserver",
+            Value::Sequence(vec![
+                s("https://dns.alidns.com/dns-query"),
+                s("https://doh.pub/dns-query"),
+                s("223.5.5.5"),
+            ]),
+        ));
+    } else {
+        dns_entries.push((
             "nameserver",
             Value::Sequence(vec![s("https://1.1.1.1/dns-query"), s("https://8.8.8.8/dns-query")]),
-        ),
-    ]);
+        ));
+    }
+    root["dns"] = map(dns_entries);
     generated.yaml = serde_yaml_ng::to_string(&root).expect("capture yaml");
     generated
 }
@@ -723,7 +824,7 @@ mod tests {
         let rules_port=free(); let forward_port=free();
         let mut l = Listener::new_default("rules-port".into(), rules_port);
         l.exit = Some(e.id.clone());
-        l.routing = Some(ListenerRouting { rules: vec![PortRule { matcher: RuleMatch::DomainSuffix, value: "example.com".into(), action: RuleAction::Reject }, PortRule {matcher:RuleMatch::Domain,value:"localhost".into(),action:RuleAction::Direct}, PortRule {matcher:RuleMatch::Ipv4Cidr,value:"127.0.0.0/8".into(),action:RuleAction::Proxy}], unmatched: RuleAction::Direct });
+        l.routing = Some(ListenerRouting { bypass_cn: false, rules: vec![PortRule { matcher: RuleMatch::DomainSuffix, value: "example.com".into(), action: RuleAction::Reject }, PortRule {matcher:RuleMatch::Domain,value:"localhost".into(),action:RuleAction::Direct}, PortRule {matcher:RuleMatch::Ipv4Cidr,value:"127.0.0.0/8".into(),action:RuleAction::Proxy}], unmatched: RuleAction::Direct });
         let mut forward = Listener::new_default("forward-port".into(), forward_port);
         forward.exit = Some(e.id.clone());
         m.exits.push(e); m.listeners = vec![l, forward];
@@ -770,6 +871,105 @@ mod tests {
         let after = generate(&GenInput { model: &m, health: &h, secret: "test", fetch_listeners: &[], nics: &[] });
         assert_ne!(before, after.plan.listeners["rules-port"].listener_fingerprint);
         assert_eq!(g.plan.listeners["forward-port"], after.plan.listeners["forward-port"]);
+    }
+
+    #[test]
+    fn builtin_cn_bypass_checked_by_bundled_core_and_never_applied_to_hidden_listeners() {
+        let mut m = Model::default();
+        let e = Exit { name: "outbound".into(), ..Exit::default() };
+        let hidden_exit = Exit {
+            id: ExitId("hidden-exit".into()),
+            name: "__proc_exit_ai".into(),
+            hidden: true,
+            ..Exit::default()
+        };
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        m.settings.controller_port = free();
+        let rules_port = free();
+        let hidden_port = free();
+        let mut l = Listener::new_default("cn-port".into(), rules_port);
+        l.exit = Some(e.id.clone());
+        l.routing = Some(ListenerRouting {
+            bypass_cn: true,
+            rules: vec![PortRule {
+                matcher: RuleMatch::DomainSuffix,
+                value: "baidu.com".into(),
+                action: RuleAction::Reject,
+            }],
+            unmatched: RuleAction::Reject,
+        });
+        let mut hidden = Listener::new_default("__proc_ai".into(), hidden_port);
+        hidden.hidden = true;
+        hidden.listener_type = ListenerType::Socks;
+        hidden.exit = Some(hidden_exit.id.clone());
+        hidden.routing = Some(ListenerRouting::default_bypass());
+        let exit_id = e.id.clone();
+        m.exits = vec![e, hidden_exit];
+        m.listeners = vec![l, hidden];
+
+        let h = evaluate(&m, &[]);
+        let input = GenInput { model: &m, health: &h, secret: "test", fetch_listeners: &[], nics: &[] };
+        let g = generate(&input);
+        let v: Value = serde_yaml_ng::from_str(&g.yaml).unwrap();
+        assert!(v.get("rule-providers").is_some(), "expected rule-providers when bypass_cn is enabled");
+        // Hidden AI / process-routing listener never gets per-port routing rules.
+        let hidden_yaml = v["listeners"].as_sequence().unwrap().iter().find(|x| x["name"] == "__proc_ai").unwrap();
+        assert_eq!(hidden_yaml["proxy"], "__proc_exit_ai");
+        assert!(hidden_yaml.get("rule").is_none());
+
+        let td = tempfile::tempdir().unwrap();
+        ensure_builtin_rules(td.path()).unwrap();
+        let config = td.path().join("config.yaml");
+        std::fs::write(&config, &g.yaml).unwrap();
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries/mihomo-x86_64-pc-windows-msvc.exe");
+        let check = std::process::Command::new(&bin).arg("-t").arg("-d").arg(td.path()).arg("-f").arg(&config).output().unwrap();
+        assert!(check.status.success(), "{} {}", String::from_utf8_lossy(&check.stdout), String::from_utf8_lossy(&check.stderr));
+
+        let tun = generate_for_capture(&input, Some(&exit_id));
+        let tun_cfg = td.path().join("tun.yaml");
+        std::fs::write(&tun_cfg, &tun.yaml).unwrap();
+        let tun_check = std::process::Command::new(&bin).arg("-t").arg("-d").arg(td.path()).arg("-f").arg(&tun_cfg).output().unwrap();
+        assert!(tun_check.status.success(), "{} {}", String::from_utf8_lossy(&tun_check.stdout), String::from_utf8_lossy(&tun_check.stderr));
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = origin.accept().await else { break; };
+                    tokio::spawn(async move {
+                        let mut buf = [0; 4096];
+                        let _ = socket.read(&mut buf).await;
+                        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nrouta-cn").await;
+                    });
+                }
+            });
+            struct ChildGuard(std::process::Child);
+            impl Drop for ChildGuard { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+            let _child = ChildGuard(std::process::Command::new(&bin).arg("-d").arg(td.path()).arg("-f").arg(&config).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+            let mut ready = false;
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", rules_port)).await.is_ok() { ready = true; break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(ready, "bundled core did not start");
+            let client = reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{rules_port}")).unwrap())
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap();
+            // Private IP & private domain bypass unmatched=Reject via built-in MRS rules.
+            assert_eq!(client.get(format!("http://127.0.0.1:{origin_port}/")).send().await.unwrap().text().await.unwrap(), "routa-cn");
+            assert_eq!(client.get(format!("http://localhost:{origin_port}/")).send().await.unwrap().text().await.unwrap(), "routa-cn");
+            // Custom rule precedes built-in CN domain rule: baidu.com is rejected.
+            let custom_rejected = client.get("http://www.baidu.com/").send().await;
+            assert!(custom_rejected.is_err() || !custom_rejected.unwrap().status().is_success());
+            // Foreign domain hits unmatched=Reject.
+            let foreign_rejected = client.get("http://example.com/").send().await;
+            assert!(foreign_rejected.is_err() || !foreign_rejected.unwrap().status().is_success());
+            server.abort();
+        });
     }
 
     #[test]
